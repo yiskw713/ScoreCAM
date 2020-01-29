@@ -330,13 +330,14 @@ class SmoothGradCAMpp(CAM):
 class ScoreCAM(CAM):
     """ Score CAM """
 
-    def __init__(self, model, target_layer):
+    def __init__(self, model, target_layer, n_batch=32):
         super().__init__(model, target_layer)
         """
         Args:
             model: a base model
             target_layer: conv_layer you want to visualize
         """
+        self.n_batch = n_batch
 
     def forward(self, x, idx=None):
         """
@@ -347,56 +348,58 @@ class ScoreCAM(CAM):
             heatmap: class activation mappings of predicted classes
         """
 
-        _, _, H, W = x.shape
+        with torch.no_grad():
+            _, _, H, W = x.shape
+            device = x.device
 
-        self.model.zero_grad()
-        score = self.model(x)
-        prob = F.softmax(score, dim=1)
-
-        if idx is None:
-            p, idx = torch.max(prob, dim=1)
-            idx = idx.item()
-
-        # calculate the derivate of probabilities, not that of scores
-        prob[0, idx].backward(retain_graph=True)
-
-        self.activations = self.values.activations.clone()
-        # put activation maps through relu activation
-        # because the values are not normalized with eq.(1) without relu.
-        self.activations = F.relu(self.activations)
-        self.activations = F.interpolate(
-            self.activations, (H, W), mode='bilinear')
-        _, C, _, _ = self.activations.shape
-
-        # normalization
-        act_min, _ = self.activations.view(1, C, -1).min(dim=2)
-        act_min = act_min.view(1, C, 1, 1)
-        act_max, _ = self.activations.view(1, C, -1).max(dim=2)
-        act_max = act_max.view(1, C, 1, 1)
-        denominator = torch.where(
-            (act_max - act_min) != 0., act_max - act_min, torch.tensor(1.)
-        )
-
-        self.activations = self.activations / denominator
-
-        # generate masked images and calculate class probabilities
-        probs = []
-        for i in range(C):
-            masked_x = x.clone()
-            mask = self.activations[:, i].clone()
-            masked_x = masked_x * mask
+            self.model.zero_grad()
             score = self.model(x)
-            probs.append(F.softmax(score, dim=1)[0, idx].item())
+            prob = F.softmax(score, dim=1)
 
-        weights = torch.tensor(probs).view(1, C, 1, 1)
+            if idx is None:
+                p, idx = torch.max(prob, dim=1)
+                idx = idx.item()
+                # print("predicted class ids {}\t probability {}".format(idx, p))
 
-        # shape = > (1, 1, H, W)
-        cam = (weights * self.activations).sum(1, keepdim=True)
-        cam = F.relu(cam)
-        cam -= torch.min(cam)
-        cam /= torch.max(cam)
+            # # calculate the derivate of probabilities, not that of scores
+            # prob[0, idx].backward(retain_graph=True)
 
-        print("predicted class ids {}\t probability {}".format(idx, p))
+            self.activations = self.values.activations.to('cpu').clone()
+            # put activation maps through relu activation
+            # because the values are not normalized with eq.(1) without relu.
+            self.activations = F.relu(self.activations)
+            self.activations = F.interpolate(
+                self.activations, (H, W), mode='bilinear')
+            _, C, _, _ = self.activations.shape
+
+            # normalization
+            act_min, _ = self.activations.view(1, C, -1).min(dim=2)
+            act_min = act_min.view(1, C, 1, 1)
+            act_max, _ = self.activations.view(1, C, -1).max(dim=2)
+            act_max = act_max.view(1, C, 1, 1)
+            denominator = torch.where(
+                (act_max - act_min) != 0., act_max - act_min, torch.tensor(1.)
+            )
+
+            self.activations = self.activations / denominator
+
+            # generate masked images and calculate class probabilities
+            probs = []
+            for i in range(0, C, self.n_batch):
+                mask = self.activations[:, i:i+self.n_batch].transpose(0, 1)
+                mask = mask.to(device)
+                masked_x = x * mask
+                score = self.model(masked_x)
+                probs.append(F.softmax(score, dim=1)[:, idx].to('cpu').data)
+
+            probs = torch.stack(probs)
+            weights = probs.view(1, C, 1, 1)
+
+            # shape = > (1, 1, H, W)
+            cam = (weights * self.activations).sum(1, keepdim=True)
+            cam = F.relu(cam)
+            cam -= torch.min(cam)
+            cam /= torch.max(cam)
 
         return cam.data, idx
 
